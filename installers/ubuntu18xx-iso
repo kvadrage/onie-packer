@@ -1,0 +1,234 @@
+#!/bin/sh
+#
+#  Copyright (C) 2018 Alexander Petrovskiy <alexpe@mellanox.com>
+#
+#  SPDX-License-Identifier: GPL-2.0
+#
+#  ONIE Installer script for Ubuntu 18.04 and 18.10 ISO images
+#
+
+THDD=/dev/sda
+PNUM=3
+TDEV="$THDD$PNUM"
+TLABEL=NOS
+TDIR=`mktemp -d`
+ISODIR=/mnt/iso
+FSFILE="$ISODIR/casper/filesystem.squashfs"
+FSDIR=/mnt/fs
+
+HOSTNAME=sw
+USERNAME=admin
+USERPASS=admin
+ROOTPASS=Password1
+
+cleanup() {
+    chroot "$TDIR" sh -c 'umount /proc; umount /sys; umount /dev/pts'
+    sleep 1
+    umount $TDIR > /dev/null 2>&1
+    umount $FSDIR > /dev/null 2>&1
+    umount $ISODIR > /dev/null 2>&1
+    rm -rf $TDIR
+}
+
+fail() {
+    [ "$1" != "" ] && echo $1
+    exit 1
+}
+
+echo "I: Creating partition..."
+sgdisk $THDD -d 3
+partprobe $THDD
+sgdisk -N $PNUM -A $PNUM:set:2 -t $PNUM:8300 $THDD
+partprobe $THDD
+
+echo "I: Creating filesystem..."
+mke2fs -t ext4 -m5 $TDEV
+mke2fs -L $TLABEL $TDEV
+
+mount -t ext4 $TDEV $TDIR
+[ $? -ne 0 ] && fail "Error creating rootfs! Exiting..." 
+
+
+echo "I: Extracting installer ISO..."
+sed -re '1,/^__DATA__$/d' < "$0" > /tmp/installer.iso
+[ $? -ne 0 ] && fail "Error extracting ISO! Exiting..." 
+
+echo "I: Mounting installer ISO..."
+mkdir $ISODIR $FSDIR
+mount -o loop /tmp/installer.iso $ISODIR
+[ $? -ne 0 ] && fail "Error mounting ISO FS! Exiting..." 
+echo "I: Mounting installer FS..."
+mount -o loop -t squashfs $FSFILE $FSDIR
+[ $? -ne 0 ] && fail "Error mounting installer FS! Exiting..." 
+
+echo "I: Extracting installer rootfs..."
+cp -a $FSDIR/* $TDIR/
+[ $? -ne 0 ] && fail "Error extracting rootfs! Exiting..." 
+cp -a /dev/sd* "$TDIR/dev/"
+
+# GET UBUNTU RELEASE INFORMATION
+echo "I: Checking Ubuntu Version..."
+. "$TDIR/etc/os-release"
+if [ "$VERSION_ID" = "18.04" ] || [ "$VERSION_ID" = "18.10" ]
+then
+        echo "I: Ubuntu $VERSION_ID is detected"
+else
+        fail "Unsupported Ubuntu version: $VERSION_ID"
+fi
+
+# RECONFIGURE OS
+echo "I: Reconfiguring OS..."
+
+# MOUNT VIRTUAL FS
+chroot "$TDIR" sh -c 'mount -t proc /proc /proc; mount -t sysfs /sys /sys; mount -t devpts devpts /dev/pts'
+
+# SET UP SSH
+chroot "$TDIR" sh -c "systemctl enable ssh.service"
+chroot "$TDIR" sh -c "ssh-keygen -A"
+
+# REMOVE SOME PACKAGES
+chroot "$TDIR" sh -c "apt purge snapd squashfs-tools cloud-init unattended-upgrades apport -y"
+
+# CONFIGURE ADDITIONAL SERVICES
+chroot "$TDIR" sh -c 'systemctl disable apparmor.service'
+chroot "$TDIR" sh -c 'systemctl disable apt-daily-upgrade apt-daily-upgrade.timer'
+chroot "$TDIR" sh -c 'systemctl disable open-iscsi.service open-vm-tools.service iscsid.socket'
+chroot "$TDIR" sh -c 'systemctl disable motd-news.timer'
+
+# DISABLE DYNAMIC MOTD
+sed -i -- 's/ENABLED=1/ENABLED=0/g' "$TDIR/etc/default/motd-news"
+
+# CONFIGURE USERS
+chroot "$TDIR" sh -c "useradd -m -s /bin/bash -G sudo -p `cryptpw $USERPASS` $USERNAME"
+chroot "$TDIR" sh -c "usermod -p `cryptpw $ROOTPASS` root"
+
+# CONFIGURE UDEV RULES FOR PORT NAMING
+cat << EOF > "$TDIR/etc/udev/rules.d/10-local.rules"
+SUBSYSTEM=="net", ACTION=="add", ATTR{phys_switch_id}!="", ATTR{phys_port_name}!="", NAME="sw\$attr{phys_port_name}"
+EOF
+
+# CONFIGURE MGMT NETWORKING WITH NETPLAN (FOR 18.04 and 18.10)
+cat << EOF > "$TDIR/etc/netplan/10-mgmt.yaml"
+network:
+    ethernets:
+        eth0:
+            addresses: []
+            dhcp4: true
+    version: 2
+EOF
+
+# CONFIGURE HOSTNAME
+chroot "$TDIR" sh -c "echo $HOSTNAME > /etc/hostname"
+cat << EOF > "$TDIR/etc/hosts"
+127.0.0.1       localhost $HOSTNAME
+::1             localhost ip6-localhost ip6-loopback $HOSTNAME
+fe00::0         ip6-localnet
+ff02::1         ip6-allnodes
+ff02::2         ip6-allrouters
+ff02::3         ip6-allhosts
+EOF
+
+# CONFIGURE SYSCTLS
+cat << EOF > "$TDIR/usr/lib/sysctl.d/90-override.conf"
+# networking defaults for switches
+net.core.default_qdisc=pfifo_fast
+net.ipv4.ip_forward=1
+net.ipv6.conf.all.forwarding=1
+net.ipv4.tcp_l3mdev_accept=1
+net.ipv4.udp_l3mdev_accept=1
+net.ipv4.fib_multipath_hash_policy=1
+net.ipv4.conf.default.ignore_routes_with_linkdown=1
+net.ipv6.conf.all.keep_addr_on_down=1
+net.ipv4.conf.default.rp_filter=0
+net.ipv4.conf.all.rp_filter=0
+net.ipv4.tcp_syncookies=0
+net.core.optmem_max=25165824
+net.core.somaxconn=4096
+net.ipv4.tcp_max_syn_backlog=5000
+EOF
+
+# ADD SIMPLE NETWORK CONFIGURATION SCRIPT FOR PERSISTENCE
+cat << EOF > "$TDIR/etc/rc.local"
+#!/bin/sh
+
+clean() {
+        ip addr flush dev lo
+        ip addr add 127.0.0.1/8 dev lo
+        ip -br link show type vxlan | cut -d' ' -f1 | xargs -I{} \
+            ip link del dev {}
+        ip -br link show type macvlan | cut -d' ' -f1 | cut -d'@' -f1 | xargs -I{} \
+            ip link del dev {}
+        ip -br link show type vlan | cut -d' ' -f1 | cut -d'@' -f1 | xargs -I{} \
+            ip link del dev {}
+        ip -br link show type bridge | cut -d' ' -f1 | xargs -I{} \
+            ip link del dev {}
+        ip -br link show type bond | cut -d' ' -f1 | xargs -I{} \
+            ip link del dev {}
+        ip -br link show type team | cut -d' ' -f1 | xargs -I{} \
+            ip link del dev {}
+        ip -br link show type vrf | cut -d' ' -f1 | xargs -I{} \
+            ip link del dev {}
+        ip -br link show | cut -d' ' -f1 | grep "^swp" | xargs -I{} \
+            ip addr flush dev {}
+        exit
+}
+
+# handle clean agrument
+[ "\$1" = "clean" ] && clean
+
+
+# ADD YOUR COMMANDS HERE
+
+
+# bring all physical interfaces up
+for iface in \$(ls /sys/class/net/ | grep ^swp); do
+  ip link set dev \$iface up
+done
+EOF
+chroot "$TDIR" sh -c 'chmod +x /etc/rc.local'
+
+# BOOTLOADER INSTALLATION
+
+# ALPINE
+# https://wiki.alpinelinux.org/wiki/Bootloaders
+# chroot "$TDIR" sh -c 'mount -t proc /proc /proc; dd bs=440 count=1 conv=notrunc if=/usr/share/syslinux/gptmbr.bin of=/dev/sda; extlinux --install /boot; update-extlinux; setup-sshd -c openssh; umount /proc'
+
+# UBUNTU
+# https://help.ubuntu.com/community/Grub2/Installing
+echo "I: Installing GRUB2..."
+cat << EOF > "$TDIR/etc/default/grub"
+GRUB_DEFAULT=0
+GRUB_TIMEOUT=5
+GRUB_DISTRIBUTOR=`chroot "$TDIR" sh -c "lsb_release -i -s 2> /dev/null || echo Debian"`
+GRUB_CMDLINE_LINUX_DEFAULT=""
+GRUB_CMDLINE_LINUX="acpi=noirq net.ifnames=0 biosdevname=0 console=tty1 console=ttyS0,115200"
+GRUB_TERMINAL="console serial"
+GRUB_SERIAL_COMMAND="serial --speed=115200 --unit=0 --word=8 --parity=no --stop=1"
+GRUB_DISABLE_OS_PROBER=true
+EOF
+
+# ADD ONIE ENTRY IN GRUB MENU
+cat << EOF >> "$TDIR/etc/grub.d/40_custom"
+menuentry "ONIE" {
+  search --no-floppy --label --set=root ONIE-BOOT
+  echo "Loading ONIE..."
+  chainloader +1
+}
+EOF
+chroot "$TDIR" sh -c 'update-initramfs -u; grub-install /dev/sda; update-grub'
+
+# SET FSTAB
+cat << EOF > "$TDIR/etc/fstab"
+# |fs              |mount point    |type   |options                    |dump    |pass
+LABEL=$TLABEL       /               ext4    relatime,errors=remount-ro  0        1
+LABEL=ONIE-BOOT     /mnt/onie-boot  auto    defaults                    0        0
+EOF
+
+#sync
+echo "I: Cleaning up..."
+cleanup
+
+echo "I: Installation finished!"
+exit 0
+
+__DATA__
