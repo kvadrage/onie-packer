@@ -15,9 +15,9 @@ Default installer: `ubuntu18xx-iso`
 
 ### Ubuntu
 
-* Supported versions: 18.04, 18.10
+* Supported versions: 18.04.1, 18.10
 * Supported OS images:
-  * ubuntu-18.04-live-server-amd64.iso
+  * ubuntu-18.04.1-live-server-amd64.iso
   * ubuntu-18.10-live-server-amd64.iso
 * Default credentials:
   * admin/admin
@@ -25,6 +25,8 @@ Default installer: `ubuntu18xx-iso`
 
 ## Currently supported switches
 
+* Mellanox SN2700
+* Mellanox SN2410
 * Mellanox SN2100
 * Mellanox SN2010
 
